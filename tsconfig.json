@@ -5,14 +5,11 @@
     "lib": ["esnext"],
     "types": ["node"],
     "rootDir": "./src",
-    "sourceMap": true,
+    "outDir": "./dist",
     "allowJs": true,
     "skipLibCheck": true,
     "strict": true,
-    "noEmit": true,
     "esModuleInterop": true,
-    "declaration": true,
-    "declarationMap": true,
     "moduleResolution": "bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
@@ -23,6 +20,6 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["**/*.ts", "**/*.tsx"],
+  "include": ["**/*.ts"],
   "exclude": ["node_modules"]
 }

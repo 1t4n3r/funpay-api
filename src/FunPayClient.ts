@@ -1,9 +1,21 @@
 import * as cheerio from 'cheerio';
 import { EventEmitter } from 'events';
 import type { IApiConfig, IProfile, IOrder, IChatMessage } from '@/types';
+import * as fs from 'fs';
 
 const DEFAULT_BASE = 'https://funpay.com';
 const DEFAULT_TIMEOUT = 10000;
+const DEFAULT_PROFILE_URL = '/users/';
+const DEFAULT_ORDERS_URL = '/orders/trade';
+
+function delay(ms: number, callback: () => void) {
+  return new Promise((resolve) =>
+    setTimeout(() => {
+      callback();
+      resolve(null);
+    }, ms),
+  );
+}
 
 function timeoutFetch(url: string, init: RequestInit = {}, timeout = DEFAULT_TIMEOUT) {
   const controller = new AbortController();
@@ -25,7 +37,7 @@ export class FunPayClient extends EventEmitter {
   private pollingIntervalMs: number;
 
   // internal state for polling events
-  private lastOrders = new Map<number, IOrder>();
+  private lastOrders = new Map<string, IOrder>();
   private lastMessages = new Map<number, IChatMessage>();
   private lastBalance = 0;
   private polling = false;
@@ -43,16 +55,33 @@ export class FunPayClient extends EventEmitter {
     return {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-      'Cookie': `golden_key=${this.goldenKey}`,
+      Cookie: `golden_key=${this.goldenKey}`,
       ...(extra ?? {}),
     };
   }
 
-  private async fetchHtml(path: string): Promise<string> {
-    const url = `${this.baseUrl}${path}`;
-    const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
-    return await res.text();
+  private async fetchOrders(): Promise<string> {
+    try {
+      const url = `${this.baseUrl}${DEFAULT_ORDERS_URL}`;
+      const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
+      return await res.text();
+    } catch (err: any) {
+      console.log(`Error: ${err.message}`);
+      return '';
+    }
+  }
+
+  private async fetchProfile(id: number): Promise<string> {
+    try {
+      const url = `${this.baseUrl}${DEFAULT_PROFILE_URL}${id}/`;
+      const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
+      return await res.text();
+    } catch (err: any) {
+      console.log(`Error: ${err.message}`);
+      return '';
+    }
   }
 
   private async postForm(path: string, body: Record<string, string>): Promise<{ ok: boolean; text?: string }> {
@@ -71,60 +100,60 @@ export class FunPayClient extends EventEmitter {
   }
 
   // ---------- API methods ----------
-  async getProfile(): Promise<IProfile> {
-    const html = await this.fetchHtml('/');
+  async getProfile(profileUrl: string): Promise<IProfile> {
+    const profileId = +profileUrl.replace(/\D*(\d+)\/?$/, '$1');
+
+    const html = await this.fetchProfile(profileId);
     const $ = cheerio.load(html);
 
-    const name = $('.user-link__name').first().text().trim() || $('.topbar .user-link').text().trim();
-    const avatar = $('.user-link__avatar img').attr('src') ?? undefined;
-    const balanceText = $('.balance, .profile__balance').first().text().trim();
-    const balance = balanceText ? parseFloat(balanceText.replace(/[^\d,.-]/g, '').replace(',', '.')) : undefined;
-    const ratingText = $('.rating').first().text().trim();
-    const rating = ratingText ? parseFloat(ratingText.replace(',', '.')) : undefined;
+    const name = $('.mb40').children().first().text().trim();
+    const avatarStyleAttr = $('.avatar-photo').attr('style');
+    const urlMatch = avatarStyleAttr?.match(/url\(["']?(.*?)["']?\)/i) || [
+      'url',
+      `${this.baseUrl}/img/layout/avatar.png`,
+    ];
+    const avatarUrl = urlMatch[1];
+    const rating = parseFloat($('.rating-value').first().text().trim()) || 0;
 
     return {
-      name: name || '',
-      avatar,
-      balance,
-      rating,
-      link: name ? `${this.baseUrl}/users/${encodeURIComponent(name)}` : undefined,
+      id: profileId,
+      name: name,
+      avatarUrl: avatarUrl,
+      rating: rating,
+      url: profileUrl,
     };
   }
 
-  async getBalance(): Promise<number> {
-    // try dedicated page, fallback to main profile parse
-    try {
-      const html = await this.fetchHtml('/account/finance');
-      const $ = cheerio.load(html);
-      const t = $('.balance, .finance__balance').first().text() || '';
-      const v = parseFloat(t.replace(/[^\d,.-]/g, '').replace(',', '.')) || 0;
-      return v;
-    } catch {
-      const p = await this.getProfile();
-      return p.balance ?? 0;
-    }
-  }
+  // async getBalance(): Promise<number> {
+  //   try {
+  //     const html = await this.fetchHtml('/account/balance');
+  //     const $ = cheerio.load(html);
+  //     return parseFloat($('.balances-value').first().text());
+  //   } catch {
+  //     const p = await this.getProfile();
+  //     return p.balance ?? 0;
+  //   }
+  // }
 
-  async getOrders(): Promise<IOrder[]> {
-    const html = await this.fetchHtml('/orders/trade');
+  async getOrders(startIndex: number = 0, lastIndex: number = 10): Promise<IOrder[]> {
+    const html = await this.fetchOrders();
     const $ = cheerio.load(html);
     const orders: IOrder[] = [];
 
-    // generic selector tolerant to markup changes
-    $('.tc-item').each((_, element) => {
-      const el = $(element);
-
+    for (let i = startIndex; i < lastIndex && i < $('.tc-item').length; i++) {
+      const el = $('.tc-item').eq(i);
       const date = el.find('.tc-date-time').text().trim();
       const id = el.find('.tc-order').text().trim();
-      const buyer = el.find('span.pseudo-a').attr('data-href') || '';
+      const buyerUrl = el.find('span.pseudo-a').attr('data-href') || '';
+      const buyer = await this.getProfile(buyerUrl);
       const status = el.find('.tc-status').text().trim();
       const price = parseFloat(el.find('.tc-price').text().trim());
-      const descText = el.find('.order-desc').text().trim();
-      const amountMatch = descText.match(/\d+/);
-      const amount = amountMatch ? parseInt(amountMatch[0], 10) : 0;
+      const descText = el.find('.order-desc').children().first().text().trim();
+      const amountMatch = descText.match(/(\d+)\s*шт/i);
+      const amount = amountMatch ? parseInt(amountMatch[1]) : 1;
 
       orders.push({ date, id, buyer, status, price, amount });
-    });
+    }
 
     return orders;
   }
@@ -203,10 +232,10 @@ export class FunPayClient extends EventEmitter {
 
     // initialize snapshots
     try {
-      const [orders, msgs, bal] = await Promise.all([this.getOrders(), this.getChats(), this.getBalance()]);
+      const [orders, messages, balance] = await Promise.all([this.getOrders(), this.getChats(), this.getBalance()]);
       orders.forEach((o) => this.lastOrders.set(o.id, o));
-      msgs.forEach((m) => this.lastMessages.set(m.id, m));
-      this.lastBalance = bal;
+      messages.forEach((m) => this.lastMessages.set(m.id, m));
+      this.lastBalance = balance;
     } catch {
       // ignore init errors
     }

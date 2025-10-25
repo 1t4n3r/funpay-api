@@ -1,21 +1,9 @@
 import * as cheerio from 'cheerio';
 import { EventEmitter } from 'events';
-import type { IApiConfig, IProfile, IOrder, IChatMessage } from '@/types';
-import * as fs from 'fs';
+import type { IApiConfig, IProfile, IOrder, IChat, IChatMessage } from '@/types';
 
-const DEFAULT_BASE = 'https://funpay.com';
+const DEFAULT_BASE_URL = 'https://funpay.com';
 const DEFAULT_TIMEOUT = 10000;
-const DEFAULT_PROFILE_URL = '/users/';
-const DEFAULT_ORDERS_URL = '/orders/trade';
-
-function delay(ms: number, callback: () => void) {
-  return new Promise((resolve) =>
-    setTimeout(() => {
-      callback();
-      resolve(null);
-    }, ms),
-  );
-}
 
 function timeoutFetch(url: string, init: RequestInit = {}, timeout = DEFAULT_TIMEOUT) {
   const controller = new AbortController();
@@ -38,14 +26,14 @@ export class FunPayClient extends EventEmitter {
 
   // internal state for polling events
   private lastOrders = new Map<string, IOrder>();
-  private lastMessages = new Map<number, IChatMessage>();
+  private lastMessages = new Map<number, IChat>();
   private lastBalance = 0;
   private polling = false;
 
   constructor(config: IApiConfig) {
     super();
     this.goldenKey = config.goldenKey;
-    this.baseUrl = config.baseUrl ?? DEFAULT_BASE;
+    this.baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
     this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT;
     this.pollingIntervalMs = config.pollingIntervalMs ?? 15000;
   }
@@ -62,7 +50,7 @@ export class FunPayClient extends EventEmitter {
 
   private async fetchOrders(): Promise<string> {
     try {
-      const url = `${this.baseUrl}${DEFAULT_ORDERS_URL}`;
+      const url = `${this.baseUrl}/orders/trade`;
       const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
       return await res.text();
@@ -74,7 +62,7 @@ export class FunPayClient extends EventEmitter {
 
   private async fetchProfile(id: number): Promise<string> {
     try {
-      const url = `${this.baseUrl}${DEFAULT_PROFILE_URL}${id}/`;
+      const url = `${this.baseUrl}/users/${id}/`;
       const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
       if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
       return await res.text();
@@ -82,6 +70,52 @@ export class FunPayClient extends EventEmitter {
       console.log(`Error: ${err.message}`);
       return '';
     }
+  }
+
+  private async fetchBalance(): Promise<string> {
+    try {
+      const url = `${this.baseUrl}/account/balance`;
+      const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
+      return await res.text();
+    } catch (err: any) {
+      console.log(`Error: ${err.message}`);
+      return '';
+    }
+  }
+
+  private async fetchChats(): Promise<string> {
+    try {
+      const url = `${this.baseUrl}/chat/`;
+      const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
+      return await res.text();
+    } catch (err: any) {
+      console.log(`Error: ${err.message}`);
+      return '';
+    }
+  }
+
+  private async fetchChatMessages(chatId: number): Promise<string> {
+    try {
+      const url = `${this.baseUrl}/chat/?node=${chatId}`;
+      const res = await timeoutFetch(url, { headers: this.headers() }, this.timeoutMs);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} (${url})`);
+      return await res.text();
+    } catch (err: any) {
+      console.log(`Error: ${err.message}`);
+      return '';
+    }
+  }
+
+  private async getChatAuthorUrl(chatId: number): Promise<string> {
+    const html = await this.fetchChatMessages(chatId);
+    const $ = cheerio.load(html);
+
+    const authorUrl = $('.media-body a').attr('href')!;
+    console.log(authorUrl)
+
+    return authorUrl;
   }
 
   private async postForm(path: string, body: Record<string, string>): Promise<{ ok: boolean; text?: string }> {
@@ -106,14 +140,14 @@ export class FunPayClient extends EventEmitter {
     const html = await this.fetchProfile(profileId);
     const $ = cheerio.load(html);
 
-    const name = $('.mb40').children().first().text().trim();
+    const name = $('.mb40').children().first().text();
     const avatarStyleAttr = $('.avatar-photo').attr('style');
     const urlMatch = avatarStyleAttr?.match(/url\(["']?(.*?)["']?\)/i) || [
       'url',
       `${this.baseUrl}/img/layout/avatar.png`,
     ];
     const avatarUrl = urlMatch[1];
-    const rating = parseFloat($('.rating-value').first().text().trim()) || 0;
+    const rating = parseFloat($('.rating-value').first().text()) || 0;
 
     return {
       id: profileId,
@@ -124,16 +158,15 @@ export class FunPayClient extends EventEmitter {
     };
   }
 
-  // async getBalance(): Promise<number> {
-  //   try {
-  //     const html = await this.fetchHtml('/account/balance');
-  //     const $ = cheerio.load(html);
-  //     return parseFloat($('.balances-value').first().text());
-  //   } catch {
-  //     const p = await this.getProfile();
-  //     return p.balance ?? 0;
-  //   }
-  // }
+  async getBalance(): Promise<number> {
+    try {
+      const html = await this.fetchBalance();
+      const $ = cheerio.load(html);
+      return parseFloat($('.balances-value').first().text());
+    } catch {
+      return 0;
+    }
+  }
 
   async getOrders(startIndex: number = 0, lastIndex: number = 10): Promise<IOrder[]> {
     const html = await this.fetchOrders();
@@ -142,13 +175,13 @@ export class FunPayClient extends EventEmitter {
 
     for (let i = startIndex; i < lastIndex && i < $('.tc-item').length; i++) {
       const el = $('.tc-item').eq(i);
-      const date = el.find('.tc-date-time').text().trim();
-      const id = el.find('.tc-order').text().trim();
+      const date = el.find('.tc-date-time').text();
+      const id = el.find('.tc-order').text();
       const buyerUrl = el.find('span.pseudo-a').attr('data-href') || '';
       const buyer = await this.getProfile(buyerUrl);
-      const status = el.find('.tc-status').text().trim();
-      const price = parseFloat(el.find('.tc-price').text().trim());
-      const descText = el.find('.order-desc').children().first().text().trim();
+      const status = el.find('.tc-status').text();
+      const price = parseFloat(el.find('.tc-price').text());
+      const descText = el.find('.order-desc').children().first().text();
       const amountMatch = descText.match(/(\d+)\s*шт/i);
       const amount = amountMatch ? parseInt(amountMatch[1]) : 1;
 
@@ -156,21 +189,6 @@ export class FunPayClient extends EventEmitter {
     }
 
     return orders;
-  }
-
-  async acceptOrder(orderId: number): Promise<boolean> {
-    const res = await this.postForm('/orders/accept', { id: String(orderId) });
-    return res.ok;
-  }
-
-  async cancelOrder(orderId: number, reason = 'cancel'): Promise<boolean> {
-    const res = await this.postForm('/orders/cancel', { id: String(orderId), reason });
-    return res.ok;
-  }
-
-  async markAsDelivered(orderId: number): Promise<boolean> {
-    const res = await this.postForm('/orders/deliver', { id: String(orderId) });
-    return res.ok;
   }
 
   async changeOfferPrice(offerId: number, newPrice: number): Promise<boolean> {
@@ -183,39 +201,54 @@ export class FunPayClient extends EventEmitter {
     return res.ok;
   }
 
-  async getChats(): Promise<IChatMessage[]> {
-    const html = await this.fetchHtml('/chats');
+  async getChats(startIndex: number = 0, lastIndex: number = 10): Promise<IChat[]> {
+    const t1 = new Date();
+    const html = await this.fetchChats();
     const $ = cheerio.load(html);
-    const res: IChatMessage[] = [];
-    $('.chat, .chat-item, [data-chat-id]').each((_, el) => {
-      const $el = $(el);
-      const idAttr = $el.attr('data-id') ?? $el.attr('data-chat-id');
-      const id = idAttr ? parseInt(idAttr, 10) : undefined;
-      if (!id) return;
-      const author = $el.find('.chat__name, .author').first().text().trim() || undefined;
-      const message = $el.find('.chat__msg, .last-message').first().text().trim() || undefined;
-      const timestamp = $el.find('.chat__date, .time').first().text().trim() || undefined;
-      const orderIdAttr = $el.find('.chat__order, .order-id').attr('data-id') ?? undefined;
-      const orderId = orderIdAttr ? parseInt(orderIdAttr, 10) : undefined;
-      res.push({ id, orderId, author, message, timestamp });
-    });
-    return res;
+    const chats: IChat[] = [];
+
+    for (let i = startIndex; i < lastIndex && i < $('.contact-item').length; i++) {
+      const el = $('.contact-item').eq(i);
+
+      const chatId = +el.attr('data-id')!;
+
+      const author = await this.getProfile(await this.getChatAuthorUrl(chatId));
+      const date = el.find('.contact-item-time').text();
+
+      chats.push({ id: chatId, author, date });
+    }
+    console.log(Date.now() - t1.getTime());
+
+    return chats;
   }
 
-  async getChatMessages(orderId: number): Promise<IChatMessage[]> {
-    const html = await this.fetchHtml(`/chats/${orderId}`);
+  async getChatMessages(chatId: number): Promise<IChatMessage[]> {
+    const html = await this.fetchChatMessages(chatId);
     const $ = cheerio.load(html);
+
+    const elements = $('.chat-message-list').toArray();
+
     const messages: IChatMessage[] = [];
-    $('.message, .chat-message').each((_, el) => {
-      const $el = $(el);
-      const idAttr = $el.attr('data-id') ?? undefined;
-      const id = idAttr ? parseInt(idAttr, 10) : undefined;
-      if (!id) return;
-      const author = $el.find('.message__author, .author').first().text().trim() || undefined;
-      const message = $el.find('.message__text, .text').first().text().trim() || undefined;
-      const timestamp = $el.find('.message__time, .time').first().text().trim() || undefined;
-      messages.push({ id, orderId, author, message, timestamp });
-    });
+
+    let prevAuthorUrl = '';
+
+    for (const el of elements) {
+      const element = $(el);
+
+      const authorUrl = element.find('.chat-msg-author-link').attr('href') || prevAuthorUrl;
+      if (authorUrl) prevAuthorUrl = authorUrl;
+
+      let author = null;
+      if (authorUrl) {
+        author = await this.getProfile(authorUrl);
+      }
+
+      const text = element.find('.chat-msg-text').text();
+      const date = element.find('.chat-msg-date').text();
+
+      messages.push({ author, text, date });
+    }
+
     return messages;
   }
 
@@ -233,11 +266,11 @@ export class FunPayClient extends EventEmitter {
     // initialize snapshots
     try {
       const [orders, messages, balance] = await Promise.all([this.getOrders(), this.getChats(), this.getBalance()]);
-      orders.forEach((o) => this.lastOrders.set(o.id, o));
-      messages.forEach((m) => this.lastMessages.set(m.id, m));
+      orders.forEach((o: IOrder) => this.lastOrders.set(o.id, o));
+      messages.forEach((m: IChat) => this.lastMessages.set(m.id, m));
       this.lastBalance = balance;
-    } catch {
-      // ignore init errors
+    } catch (err) {
+      this.emit('error', err);
     }
 
     while (this.polling) {

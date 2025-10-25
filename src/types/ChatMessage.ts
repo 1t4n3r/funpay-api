@@ -1,7 +1,7 @@
+import type { IProfile } from './Profile'
+
 export interface IChatMessage {
-  id: number;
-  orderId?: number;
-  author?: string;
-  message?: string;
-  timestamp?: string;
+  author: IProfile | null;
+  text: string;
+  date: string;
 }
